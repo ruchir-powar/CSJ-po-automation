@@ -88,24 +88,62 @@ OUTPUT_COLUMNS = [
 # Utilities
 # =========
 def detect_header_row(df: pd.DataFrame) -> int:
-    """Find the row that actually contains SR NO. + DESIGN CODE."""
+    """Find the row that actually contains SR NO. (and usually DESIGN CODE/STYLE NO.)."""
     max_check = min(10, len(df))
     for i in range(max_check):
         row = df.iloc[i]
         vals_upper = [str(x).strip().upper() for x in row.values]
-        if "SR NO." in vals_upper and "DESIGN CODE" in vals_upper:
+        if "SR NO." in vals_upper:
             return i
     return 0
 
 
+def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Standardize column names so the rest of the code always finds:
+    - 'DESIGN CODE'
+    - 'Purity / Color'
+    Works for:
+    - Files with DESIGN CODE already
+    - Files with STYLE NO. instead
+    - Files with PURITY + GOLD COLOR instead of Purity / Color
+    """
+    upper_map = {c.upper(): c for c in df.columns}
+
+    # --- DESIGN CODE alias ---
+    if "DESIGN CODE" not in df.columns:
+        for cand in ["DESIGN CODE", "STYLE NO.", "STYLE NO", "STYLE", "STYLE CODE", "STYLE CODE."]:
+            if cand in upper_map:
+                df = df.rename(columns={upper_map[cand]: "DESIGN CODE"})
+                break
+
+    # --- Purity / Color alias or construction ---
+    if "Purity / Color" not in df.columns:
+        if "PURITY / COLOR" in upper_map:
+            # direct rename if combined exists
+            df = df.rename(columns={upper_map["PURITY / COLOR"]: "Purity / Color"})
+        elif "PURITY" in upper_map and "GOLD COLOR" in upper_map:
+            p_col = upper_map["PURITY"]
+            gc_col = upper_map["GOLD COLOR"]
+            df["Purity / Color"] = (
+                df[p_col].astype(str).str.strip()
+                + " / "
+                + df[gc_col].astype(str).str.strip()
+            )
+
+    return df
+
+
 def clean_input_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Use detected header row as header."""
+    """Use detected header row as header and normalize column names."""
     header_idx = detect_header_row(df)
     header = df.iloc[header_idx]
     new_cols = [(str(header[c]) if not pd.isna(header[c]) else str(c)) for c in df.columns]
     data = df.iloc[header_idx + 1 :].copy()
     data.columns = new_cols
-    return data.reset_index(drop=True)
+    data = data.reset_index(drop=True)
+    data = normalize_input_columns(data)
+    return data
 
 
 def make_unique_columns(columns):
@@ -312,7 +350,8 @@ def transform_to_order_import(
 st.title("PO Automation – Order Import Sheet Generator")
 
 uploaded_file = st.file_uploader(
-    "Upload RAW order sheet (e.g., JUN-D-AJ4125.xlsx)", type=["xlsx", "xls"]
+    "Upload RAW order sheet (e.g., JUN-D-AJ4125.xlsx or CSJ UPLOAD FILE- 17-11-2025.xlsx)",
+    type=["xlsx", "xls"],
 )
 
 if uploaded_file is not None:
@@ -346,8 +385,8 @@ if uploaded_file is not None:
     if "DESIGN CODE" not in clean_df.columns:
         st.error(
             "This does not look like the RAW order sheet "
-            "(no 'DESIGN CODE' column after cleaning). "
-            "You may have uploaded the already formatted Order Import file."
+            "(no 'DESIGN CODE' / 'STYLE NO.' column after cleaning). "
+            "Please check the file format."
         )
     else:
         default_order_group = uploaded_file.name.rsplit(".", 1)[0]
