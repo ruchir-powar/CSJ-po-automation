@@ -25,11 +25,15 @@ def safe_read_excel(uploaded_file):
     except ImportError as e:
         msg = str(e)
         if "openpyxl" in msg:
-            st.error("Missing dependency **openpyxl** for reading .xlsx. "
-                     "Add it to requirements.txt and redeploy.")
+            st.error(
+                "Missing dependency **openpyxl** for reading .xlsx. "
+                "Add it to requirements.txt and redeploy."
+            )
         elif "xlrd" in msg:
-            st.error("Missing dependency **xlrd==1.2.0** for reading legacy .xls. "
-                     "Either convert to .xlsx or add xlrd==1.2.0 to requirements.")
+            st.error(
+                "Missing dependency **xlrd==1.2.0** for reading legacy .xls. "
+                "Either convert to .xlsx or add xlrd==1.2.0 to requirements."
+            )
         else:
             st.error(f"Excel read error: {e}")
         st.stop()
@@ -88,7 +92,7 @@ OUTPUT_COLUMNS = [
 # Utilities
 # =========
 def detect_header_row(df: pd.DataFrame) -> int:
-    """Find the row that actually contains SR NO. (and usually DESIGN CODE/STYLE NO.)."""
+    """Find the row that actually contains SR NO. (and usually STYLE NO. etc.)."""
     max_check = min(10, len(df))
     for i in range(max_check):
         row = df.iloc[i]
@@ -120,7 +124,6 @@ def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
     # --- Purity / Color alias or construction ---
     if "Purity / Color" not in df.columns:
         if "PURITY / COLOR" in upper_map:
-            # direct rename if combined exists
             df = df.rename(columns={upper_map["PURITY / COLOR"]: "Purity / Color"})
         elif "PURITY" in upper_map and "GOLD COLOR" in upper_map:
             p_col = upper_map["PURITY"]
@@ -173,25 +176,21 @@ def transform_stylecode(design_code: str):
         return None
 
     # 1) Trailing 'A' → '-A'
-    #    EAR7757A -> EAR7757-A, ERC4215A -> ERC4215-A
     if code.endswith("A") and "-" not in code:
         return code[:-1] + "-A"
 
     # 2) Special double-letter prefixes
-    #    JLERB3500 -> JL-ERB3500, JWERB3809 -> JW-ERB3809
     if code.startswith("JL") and code[2:].startswith("ERB"):
         return "JL-" + code[2:]
     if code.startswith("JW") and code[2:].startswith("ERB"):
         return "JW-" + code[2:]
 
-    # 3) Generic J prefix (no leading hyphen in source)
-    #    JEPEB0270 -> J-EPEB0270, JERB3397 -> J-ERB3397, JXEPEB0317 -> J-XEPEB0317
+    # 3) Generic J prefix
     if code.startswith("J") and not code.startswith("JL") and not code.startswith("JW"):
         if "-" not in code:
             return "J-" + code[1:]
 
     # 4) L/T/W prefixes before EAR/ERA/ERB
-    #    LEAR10711 -> L-EAR10711, TERA0923 -> T-ERA0923, WERA0351 -> W-ERA0351
     if code.startswith("L") and code[1:4] == "EAR" and "-" not in code:
         return "L-" + code[1:]
     if code.startswith("T") and code[1:4] == "ERA" and "-" not in code:
@@ -350,8 +349,7 @@ def transform_to_order_import(
 st.title("PO Automation – Order Import Sheet Generator")
 
 uploaded_file = st.file_uploader(
-    "Upload RAW order sheet (e.g., JUN-D-AJ4125.xlsx or CSJ UPLOAD FILE- 17-11-2025.xlsx)",
-    type=["xlsx", "xls"],
+    "Upload RAW order sheet (e.g., CSJ UPLOAD FILE- 17-11-2025.xlsx)", type=["xlsx", "xls"]
 )
 
 if uploaded_file is not None:
@@ -405,30 +403,60 @@ if uploaded_file is not None:
         )
 
         if st.button("Generate Order Import Sheet"):
-            result_df = transform_to_order_import(
-                clean_df, order_group, cust_instr_template, remark_prefix
-            )
+            # ---- split input into 18KT / 14KT / Others based on Purity / Color ----
+            purity_series = clean_df.get("Purity / Color", "").astype(str).str.upper()
 
-            if result_df.empty:
+            mask_18 = purity_series.str.contains("18KT", na=False)
+            mask_14 = purity_series.str.contains("14KT", na=False)
+
+            df_18 = clean_df[mask_18].copy()
+            df_14 = clean_df[mask_14].copy()
+            df_other = clean_df[~(mask_18 | mask_14)].copy()
+
+            result_18 = transform_to_order_import(df_18, order_group, cust_instr_template, remark_prefix)
+            result_14 = transform_to_order_import(df_14, order_group, cust_instr_template, remark_prefix)
+            result_other = transform_to_order_import(df_other, order_group, cust_instr_template, remark_prefix)
+
+            if result_18.empty and result_14.empty and result_other.empty:
                 st.error("No rows generated. Check that 'ORDER PCS' has values > 0.")
             else:
-                st.subheader("Generated Order Import Sheet (Preview)")
-                st.write(f"Total rows: {len(result_df)}")
-                st.dataframe(result_df.head(50))
+                st.subheader("Generated Order Import Sheets (Preview)")
+                if not result_18.empty:
+                    st.write("**18KT Sheet Preview**")
+                    st.dataframe(result_18.head(30))
+                if not result_14.empty:
+                    st.write("**14KT Sheet Preview**")
+                    st.dataframe(result_14.head(30))
+                if not result_other.empty:
+                    st.write("**Others Sheet Preview**")
+                    st.dataframe(result_other.head(30))
 
                 buffer = BytesIO()
                 with safe_excel_writer(buffer) as writer:
-                    # make the two unnamed columns truly blank in the Excel header
-                    export_df = result_df.copy().rename(
-                        columns={"Unnamed: 2": "", "Unnamed: 25": ""}
-                    )
-                    export_df.to_excel(writer, index=False, sheet_name="Order Import")
+                    if not result_18.empty:
+                        export_18 = result_18.copy().rename(
+                            columns={"Unnamed: 2": "", "Unnamed: 25": ""}
+                        )
+                        export_18.to_excel(writer, index=False, sheet_name="18KT")
+
+                    if not result_14.empty:
+                        export_14 = result_14.copy().rename(
+                            columns={"Unnamed: 2": "", "Unnamed: 25": ""}
+                        )
+                        export_14.to_excel(writer, index=False, sheet_name="14KT")
+
+                    if not result_other.empty:
+                        export_other = result_other.copy().rename(
+                            columns={"Unnamed: 2": "", "Unnamed: 25": ""}
+                        )
+                        export_other.to_excel(writer, index=False, sheet_name="Others")
+
                 buffer.seek(0)
 
                 st.download_button(
-                    label="📥 Download Order Import Sheet (.xlsx)",
+                    label="📥 Download Order Import Workbook (.xlsx)",
                     data=buffer.getvalue(),
-                    file_name=f"{order_group}_Order_Import.xlsx",
+                    file_name=f"{order_group}_Order_Import_Split_18_14.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 else:
