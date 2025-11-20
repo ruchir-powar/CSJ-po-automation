@@ -92,47 +92,122 @@ OUTPUT_COLUMNS = [
 # Utilities
 # =========
 def detect_header_row(df: pd.DataFrame) -> int:
-    """Find the row that actually contains SR NO. (and usually STYLE NO. etc.)."""
+    """
+    Try to find the row that actually contains headers.
+    Prefer a row with SR + STYLE/DESIGN; fallback to first row with SR; else 0.
+    """
     max_check = min(10, len(df))
+    candidate_idx = 0
     for i in range(max_check):
         row = df.iloc[i]
         vals_upper = [str(x).strip().upper() for x in row.values]
-        if "SR NO." in vals_upper:
+
+        has_sr_no_like = any("SR" in v and "NO" in v for v in vals_upper)
+        has_style_like = any(("STYLE" in v) or ("DESIGN" in v) for v in vals_upper)
+
+        if has_sr_no_like and has_style_like:
             return i
-    return 0
+        if has_sr_no_like:
+            candidate_idx = i
+    return candidate_idx
 
 
 def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Standardize column names so the rest of the code always finds:
+
     - 'DESIGN CODE'
     - 'Purity / Color'
-    Works for:
-    - Files with DESIGN CODE already
-    - Files with STYLE NO. instead
-    - Files with PURITY + GOLD COLOR instead of Purity / Color
-    """
-    upper_map = {c.upper(): c for c in df.columns}
+    - 'ORDER PCS'
+    - 'DIA QUALITY'
+    - 'REMARK'
 
-    # --- DESIGN CODE alias ---
+    Works even if the raw columns are:
+    - STYLE NO, STYLE, STYLE_NO, etc.
+    - PURITY + GOLD COLOR, PURITY + COLOR/COLOUR
+    - ORDER QTY, ORDER PCS, ORDER QUANTITY, etc.
+    - DIA QUALITY, DIA QUAL, DIA QUALITY., etc.
+    - REMARKS, REMARK., etc.
+    """
+    # Build a mapping of UPPER+STRIPPED -> original column
+    upper_map = {c.upper().strip(): c for c in df.columns}
+
+    # --- DESIGN CODE alias: any STYLE* column ---
     if "DESIGN CODE" not in df.columns:
-        for cand in ["DESIGN CODE", "STYLE NO.", "STYLE NO", "STYLE", "STYLE CODE", "STYLE CODE."]:
+        # exact candidates first
+        exact_candidates = [
+            "DESIGN CODE",
+            "STYLE NO.",
+            "STYLE NO",
+            "STYLE",
+            "STYLE CODE",
+            "STYLE CODE.",
+        ]
+        mapped = False
+        for cand in exact_candidates:
             if cand in upper_map:
                 df = df.rename(columns={upper_map[cand]: "DESIGN CODE"})
+                mapped = True
                 break
 
-    # --- Purity / Color alias or construction ---
+        if not mapped:
+            # fuzzy: any column containing STYLE
+            for uc, orig in upper_map.items():
+                if "STYLE" in uc:
+                    df = df.rename(columns={orig: "DESIGN CODE"})
+                    mapped = True
+                    break
+
+    # ----- Purity / Color -----
     if "Purity / Color" not in df.columns:
-        if "PURITY / COLOR" in upper_map:
-            df = df.rename(columns={upper_map["PURITY / COLOR"]: "Purity / Color"})
-        elif "PURITY" in upper_map and "GOLD COLOR" in upper_map:
-            p_col = upper_map["PURITY"]
-            gc_col = upper_map["GOLD COLOR"]
-            df["Purity / Color"] = (
-                df[p_col].astype(str).str.strip()
-                + " / "
-                + df[gc_col].astype(str).str.strip()
-            )
+        # Case 1: column already combined
+        found_direct = False
+        for uc, orig in upper_map.items():
+            if "PURITY" in uc and "COLOR" in uc:
+                df = df.rename(columns={orig: "Purity / Color"})
+                found_direct = True
+                break
+
+        if not found_direct:
+            # Case 2: PURITY + GOLD COLOR / COLOR / COLOUR
+            purity_col = None
+            color_col = None
+            for uc, orig in upper_map.items():
+                if "PURITY" in uc and purity_col is None:
+                    purity_col = orig
+                if ("GOLD COLOR" in uc or "COLOR" in uc or "COLOUR" in uc) and color_col is None:
+                    color_col = orig
+
+            if purity_col and color_col:
+                df["Purity / Color"] = (
+                    df[purity_col].astype(str).str.strip()
+                    + " / "
+                    + df[color_col].astype(str).str.strip()
+                )
+            elif purity_col:
+                # At least keep purity if no colour
+                df["Purity / Color"] = df[purity_col].astype(str).str.strip()
+
+    # ----- ORDER PCS -----
+    if "ORDER PCS" not in df.columns:
+        for uc, orig in upper_map.items():
+            if "ORDER" in uc and ("PCS" in uc or "QTY" in uc or "QUANTITY" in uc):
+                df = df.rename(columns={orig: "ORDER PCS"})
+                break
+
+    # ----- DIA QUALITY -----
+    if "DIA QUALITY" not in df.columns:
+        for uc, orig in upper_map.items():
+            if "DIA" in uc and "QUAL" in uc:
+                df = df.rename(columns={orig: "DIA QUALITY"})
+                break
+
+    # ----- REMARK -----
+    if "REMARK" not in df.columns:
+        for uc, orig in upper_map.items():
+            if "REMARK" in uc:
+                df = df.rename(columns={orig: "REMARK"})
+                break
 
     return df
 
@@ -238,8 +313,7 @@ def transform_to_order_import(
     remark_prefix: str,
 ) -> pd.DataFrame:
     """
-    Uses only: SR NO., DESIGN CODE, CATEGORY, Purity / Color,
-               DIA PCS, DIA WT, DIA QUALITY, REMARK, ORDER PCS
+    Uses only: DESIGN CODE, Purity / Color, DIA QUALITY, REMARK, ORDER PCS
 
     Rules:
     - Ignore ring sizes entirely.
@@ -248,7 +322,7 @@ def transform_to_order_import(
         NO 2 TONE RHODIUM ON METAL PART, [REMARK text if any][, 18/14kt gilit text if applicable]
     - StoneQuality must be blank.
     """
-    if "ORDER PCS" not in clean_df.columns:
+    if "ORDER PCS" not in clean_df.columns or "DESIGN CODE" not in clean_df.columns:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     rows = []
@@ -349,12 +423,16 @@ def transform_to_order_import(
 st.title("PO Automation – Order Import Sheet Generator")
 
 uploaded_file = st.file_uploader(
-    "Upload RAW order sheet (e.g., CSJ UPLOAD FILE- 17-11-2025.xlsx)", type=["xlsx", "xls"]
+    "Upload RAW order sheet (e.g., CSJS MTR - ORDER 02.xlsx)", type=["xlsx", "xls"]
 )
 
 if uploaded_file is not None:
     raw_df = safe_read_excel(uploaded_file)
     clean_df = clean_input_df(raw_df)
+
+    # Show columns after normalization for debugging
+    st.caption("Detected columns after cleaning & normalization:")
+    st.write(list(clean_df.columns))
 
     # Preview only the columns we actually use
     preview = clean_df.copy()
@@ -374,90 +452,90 @@ if uploaded_file is not None:
     ]
     show_cols = [c for c in important_cols if c in preview.columns]
 
-    st.subheader("Cleaned Input Preview (used columns)")
+    st.subheader("Cleaned Input Preview (used columns if present)")
     if show_cols:
         st.dataframe(preview[show_cols].head(30))
     else:
-        st.warning("Could not find expected columns in the uploaded file.")
+        st.warning("Could not match the usual columns, but we will still try to convert.")
 
-    if "DESIGN CODE" not in clean_df.columns:
-        st.error(
-            "This does not look like the RAW order sheet "
-            "(no 'DESIGN CODE' / 'STYLE NO.' column after cleaning). "
-            "Please check the file format."
-        )
-    else:
-        default_order_group = uploaded_file.name.rsplit(".", 1)[0]
-        order_group = st.text_input("Order Group / PO No", value=default_order_group)
+    # EVEN IF some columns don't exist, we don't hard-stop here;
+    # transform_to_order_import will simply emit 0 rows if something critical is missing.
 
-        st.sidebar.header("Instruction Templates")
-        cust_instr_template = st.sidebar.text_area(
-            "Customer Production Instruction Template",
-            value="IGI CERTI-CO-BRANDING( {quality}), HALLMARK-BIS, REQ. AJ-STYLE NO.ON IGI CERTI",
-            height=100,
-        )
-        remark_prefix = st.sidebar.text_area(
-            "Special Remarks Base Prefix",
-            value="NO 2 TONE RHODIUM ON METAL PART",
-            height=80,
-        )
+    default_order_group = uploaded_file.name.rsplit(".", 1)[0]
+    order_group = st.text_input("Order Group / PO No", value=default_order_group)
 
-        if st.button("Generate Order Import Sheet"):
-            # ---- split input into 18KT / 14KT / Others based on Purity / Color ----
-            purity_series = clean_df.get("Purity / Color", "").astype(str).str.upper()
+    st.sidebar.header("Instruction Templates")
+    cust_instr_template = st.sidebar.text_area(
+        "Customer Production Instruction Template",
+        value="IGI CERTI-CO-BRANDING( {quality}), HALLMARK-BIS, REQ. AJ-STYLE NO.ON IGI CERTI",
+        height=100,
+    )
+    remark_prefix = st.sidebar.text_area(
+        "Special Remarks Base Prefix",
+        value="NO 2 TONE RHODIUM ON METAL PART",
+        height=80,
+    )
 
-            mask_18 = purity_series.str.contains("18KT", na=False)
-            mask_14 = purity_series.str.contains("14KT", na=False)
+    if st.button("Generate Order Import Sheet"):
+        purity_series = clean_df.get("Purity / Color", "").astype(str).str.upper()
 
-            df_18 = clean_df[mask_18].copy()
-            df_14 = clean_df[mask_14].copy()
-            df_other = clean_df[~(mask_18 | mask_14)].copy()
+        mask_18 = purity_series.str.contains("18KT", na=False)
+        mask_14 = purity_series.str.contains("14KT", na=False)
 
-            result_18 = transform_to_order_import(df_18, order_group, cust_instr_template, remark_prefix)
-            result_14 = transform_to_order_import(df_14, order_group, cust_instr_template, remark_prefix)
-            result_other = transform_to_order_import(df_other, order_group, cust_instr_template, remark_prefix)
+        df_18 = clean_df[mask_18].copy()
+        df_14 = clean_df[mask_14].copy()
+        df_other = clean_df[~(mask_18 | mask_14)].copy()
 
-            if result_18.empty and result_14.empty and result_other.empty:
-                st.error("No rows generated. Check that 'ORDER PCS' has values > 0.")
-            else:
-                st.subheader("Generated Order Import Sheets (Preview)")
+        result_18 = transform_to_order_import(df_18, order_group, cust_instr_template, remark_prefix)
+        result_14 = transform_to_order_import(df_14, order_group, cust_instr_template, remark_prefix)
+        result_other = transform_to_order_import(df_other, order_group, cust_instr_template, remark_prefix)
+
+        if result_18.empty and result_14.empty and result_other.empty:
+            st.error(
+                "No rows generated.\n\n"
+                "Check that:\n"
+                "- A STYLE / DESIGN column exists (will be mapped to 'DESIGN CODE'), and\n"
+                "- An order quantity column (ORDER PCS / ORDER QTY / etc.) exists with values > 0."
+            )
+        else:
+            st.subheader("Generated Order Import Sheets (Preview)")
+            if not result_18.empty:
+                st.write("**18KT Sheet Preview**")
+                st.dataframe(result_18.head(30))
+            if not result_14.empty:
+                st.write("**14KT Sheet Preview**")
+                st.dataframe(result_14.head(30))
+            if not result_other.empty:
+                st.write("**Others Sheet Preview**")
+                st.dataframe(result_other.head(30))
+
+            buffer = BytesIO()
+            with safe_excel_writer(buffer) as writer:
                 if not result_18.empty:
-                    st.write("**18KT Sheet Preview**")
-                    st.dataframe(result_18.head(30))
+                    export_18 = result_18.copy().rename(
+                        columns={"Unnamed: 2": "", "Unnamed: 25": ""}
+                    )
+                    export_18.to_excel(writer, index=False, sheet_name="18KT")
+
                 if not result_14.empty:
-                    st.write("**14KT Sheet Preview**")
-                    st.dataframe(result_14.head(30))
+                    export_14 = result_14.copy().rename(
+                        columns={"Unnamed: 2": "", "Unnamed: 25": ""}
+                    )
+                    export_14.to_excel(writer, index=False, sheet_name="14KT")
+
                 if not result_other.empty:
-                    st.write("**Others Sheet Preview**")
-                    st.dataframe(result_other.head(30))
+                    export_other = result_other.copy().rename(
+                        columns={"Unnamed: 2": "", "Unnamed: 25": ""}
+                    )
+                    export_other.to_excel(writer, index=False, sheet_name="Others")
 
-                buffer = BytesIO()
-                with safe_excel_writer(buffer) as writer:
-                    if not result_18.empty:
-                        export_18 = result_18.copy().rename(
-                            columns={"Unnamed: 2": "", "Unnamed: 25": ""}
-                        )
-                        export_18.to_excel(writer, index=False, sheet_name="18KT")
+            buffer.seek(0)
 
-                    if not result_14.empty:
-                        export_14 = result_14.copy().rename(
-                            columns={"Unnamed: 2": "", "Unnamed: 25": ""}
-                        )
-                        export_14.to_excel(writer, index=False, sheet_name="14KT")
-
-                    if not result_other.empty:
-                        export_other = result_other.copy().rename(
-                            columns={"Unnamed: 2": "", "Unnamed: 25": ""}
-                        )
-                        export_other.to_excel(writer, index=False, sheet_name="Others")
-
-                buffer.seek(0)
-
-                st.download_button(
-                    label="📥 Download Order Import Workbook (.xlsx)",
-                    data=buffer.getvalue(),
-                    file_name=f"{order_group}_Order_Import_Split_18_14.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            st.download_button(
+                label="📥 Download Order Import Workbook (.xlsx)",
+                data=buffer.getvalue(),
+                file_name=f"{order_group}_Order_Import_Split_18_14.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 else:
     st.info("Upload the RAW order Excel (not the already formatted Order Import file) to start.")
