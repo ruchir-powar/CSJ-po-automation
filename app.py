@@ -18,7 +18,8 @@ def safe_read_excel(uploaded_file):
         if ext in ("xlsx", "xlsm", "xltx", "xltm", ""):
             return pd.read_excel(uploaded_file, engine="openpyxl")
         elif ext == "xls":
-            return pd.read_excel(uploaded_file, engine="xlrd")  # requires xlrd==1.2.0
+            # for very old Excel files; needs xlrd==1.2.0
+            return pd.read_excel(uploaded_file, engine="xlrd")
         else:
             st.error(f"Unsupported file type: .{ext}. Please upload a .xlsx file.")
             st.stop()
@@ -26,13 +27,13 @@ def safe_read_excel(uploaded_file):
         msg = str(e)
         if "openpyxl" in msg:
             st.error(
-                "Missing dependency **openpyxl** for reading .xlsx. "
-                "Add it to requirements.txt and redeploy."
+                "Missing dependency **openpyxl** for reading .xlsx.\n"
+                "Add `openpyxl` to requirements.txt and redeploy."
             )
         elif "xlrd" in msg:
             st.error(
-                "Missing dependency **xlrd==1.2.0** for reading legacy .xls. "
-                "Either convert to .xlsx or add xlrd==1.2.0 to requirements."
+                "Missing dependency **xlrd==1.2.0** for reading legacy .xls.\n"
+                "Either convert your file to .xlsx or add `xlrd==1.2.0` to requirements.txt."
             )
         else:
             st.error(f"Excel read error: {e}")
@@ -49,7 +50,10 @@ def safe_excel_writer(buffer: BytesIO):
             import xlsxwriter  # noqa: F401
             return pd.ExcelWriter(buffer, engine="xlsxwriter")
         except ImportError:
-            st.error("Missing Excel writer engine. Install **openpyxl** or **xlsxwriter**.")
+            st.error(
+                "Missing Excel writer engine.\n"
+                "Install **openpyxl** or **xlsxwriter** in requirements.txt."
+            )
             st.stop()
 
 
@@ -134,7 +138,7 @@ def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- DESIGN CODE alias: any STYLE* column ---
     if "DESIGN CODE" not in df.columns:
-        # exact candidates first
+        # exact-ish names first
         exact_candidates = [
             "DESIGN CODE",
             "STYLE NO.",
@@ -151,9 +155,9 @@ def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
                 break
 
         if not mapped:
-            # fuzzy: any column containing STYLE
+            # fuzzy: any column containing STYLE or DESIGN
             for uc, orig in upper_map.items():
-                if "STYLE" in uc:
+                if "STYLE" in uc or "DESIGN" in uc:
                     df = df.rename(columns={orig: "DESIGN CODE"})
                     mapped = True
                     break
@@ -175,7 +179,12 @@ def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
             for uc, orig in upper_map.items():
                 if "PURITY" in uc and purity_col is None:
                     purity_col = orig
-                if ("GOLD COLOR" in uc or "COLOR" in uc or "COLOUR" in uc) and color_col is None:
+                if (
+                    "GOLD COLOR" in uc
+                    or "GOLD COLOUR" in uc
+                    or "COLOR" in uc
+                    or "COLOUR" in uc
+                ) and color_col is None:
                     color_col = orig
 
             if purity_col and color_col:
@@ -194,6 +203,12 @@ def normalize_input_columns(df: pd.DataFrame) -> pd.DataFrame:
             if "ORDER" in uc and ("PCS" in uc or "QTY" in uc or "QUANTITY" in uc):
                 df = df.rename(columns={orig: "ORDER PCS"})
                 break
+        else:
+            # Fallback: any PCS/QTY column
+            for uc, orig in upper_map.items():
+                if "PCS" in uc or "QTY" in uc or "QUANTITY" in uc:
+                    df = df.rename(columns={orig: "ORDER PCS"})
+                    break
 
     # ----- DIA QUALITY -----
     if "DIA QUALITY" not in df.columns:
@@ -235,6 +250,98 @@ def make_unique_columns(columns):
             counts[c] += 1
             new_cols.append(f"{c}_{counts[c]}")
     return new_cols
+
+
+def find_style_column(df: pd.DataFrame):
+    """
+    Try to find the style / design column in df.
+    Returns the column name or None if nothing looks like a style code.
+    """
+    cols = list(df.columns)
+
+    # If we already normalized to DESIGN CODE, prefer that
+    if "DESIGN CODE" in cols:
+        return "DESIGN CODE"
+
+    # Try exact-ish names
+    exact_candidates = [
+        "STYLE NO.",
+        "STYLE NO",
+        "STYLE",
+        "STYLE CODE",
+        "STYLE CODE.",
+        "DESIGN",
+        "DESIGN NO.",
+        "DESIGN NO",
+    ]
+    upper_map = {c.upper().strip(): c for c in cols}
+    for cand in exact_candidates:
+        if cand in upper_map:
+            return upper_map[cand]
+
+    # Fuzzy: anything containing STYLE or DESIGN
+    for c in cols:
+        up = str(c).upper()
+        if "STYLE" in up or "DESIGN" in up:
+            return c
+
+    # Very last resort: first non-obvious column
+    for c in cols:
+        up = str(c).upper()
+        if any(
+            key in up
+            for key in [
+                "SR",
+                "NO",
+                "ORDER",
+                "QTY",
+                "PCS",
+                "DATE",
+                "REMARK",
+                "PURITY",
+                "COLOR",
+                "COLOUR",
+            ]
+        ):
+            continue
+        return c
+
+    return None
+
+
+def find_qty_column(df: pd.DataFrame):
+    """
+    Try to find the order quantity column in df.
+    Returns the column name or None if nothing looks like a quantity.
+    """
+    cols = list(df.columns)
+
+    # If we already normalized to ORDER PCS, prefer that
+    if "ORDER PCS" in cols:
+        return "ORDER PCS"
+
+    upper_map = {c.upper().strip(): c for c in cols}
+
+    # Names containing ORDER + PCS/QTY/QUANTITY
+    for uc, orig in upper_map.items():
+        if "ORDER" in uc and ("PCS" in uc or "QTY" in uc or "QUANTITY" in uc):
+            return orig
+
+    # Any column with PCS/QTY/QUANTITY in name
+    for uc, orig in upper_map.items():
+        if "PCS" in uc or "QTY" in uc or "QUANTITY" in uc:
+            return orig
+
+    # Fallback: first numeric-looking column with some positive values
+    for c in cols:
+        try:
+            s = pd.to_numeric(df[c], errors="coerce")
+            if (s > 0).sum() > 0:
+                return c
+        except Exception:
+            continue
+
+    return None
 
 
 def transform_stylecode(design_code: str):
@@ -313,22 +420,35 @@ def transform_to_order_import(
     remark_prefix: str,
 ) -> pd.DataFrame:
     """
-    Uses only: DESIGN CODE, Purity / Color, DIA QUALITY, REMARK, ORDER PCS
+    Uses: style/design column, Purity / Color, DIA QUALITY, REMARK, qty column.
 
     Rules:
     - Ignore ring sizes entirely.
-    - ORDER PCS = N → create N rows; each row has OrderQty=1 and OrderItemPcs=1.
+    - qty = N → create N rows; each row has OrderQty=1 and OrderItemPcs=1.
     - SpecialRemarks format:
         NO 2 TONE RHODIUM ON METAL PART, [REMARK text if any][, 18/14kt gilit text if applicable]
     - StoneQuality must be blank.
     """
-    if "ORDER PCS" not in clean_df.columns or "DESIGN CODE" not in clean_df.columns:
+
+    # --------- auto-detect style and quantity columns ---------
+    style_col = find_style_column(clean_df)
+    qty_col = find_qty_column(clean_df)
+
+    if style_col is None or qty_col is None:
+        st.write("DEBUG – available columns:", list(clean_df.columns))
+        st.error(
+            "Could not detect style or quantity column.\n\n"
+            f"Detected style column: {style_col}\n"
+            f"Detected quantity column: {qty_col}\n\n"
+            "Please check the uploaded file's headers."
+        )
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    # ---------------------------------------------------------
 
     rows = []
 
     for _, row in clean_df.iterrows():
-        design_code = row.get("DESIGN CODE", "")
+        design_code = row.get(style_col, "")
         style_code = transform_stylecode(design_code)
         if not style_code:
             continue  # skip unwanted codes
@@ -361,7 +481,7 @@ def transform_to_order_import(
         else:
             customer_instr = cust_instr_template
 
-        qty = row.get("ORDER PCS")
+        qty = row.get(qty_col)
         if pd.isna(qty):
             continue
         try:
@@ -458,9 +578,6 @@ if uploaded_file is not None:
     else:
         st.warning("Could not match the usual columns, but we will still try to convert.")
 
-    # EVEN IF some columns don't exist, we don't hard-stop here;
-    # transform_to_order_import will simply emit 0 rows if something critical is missing.
-
     default_order_group = uploaded_file.name.rsplit(".", 1)[0]
     order_group = st.text_input("Order Group / PO No", value=default_order_group)
 
@@ -486,16 +603,23 @@ if uploaded_file is not None:
         df_14 = clean_df[mask_14].copy()
         df_other = clean_df[~(mask_18 | mask_14)].copy()
 
-        result_18 = transform_to_order_import(df_18, order_group, cust_instr_template, remark_prefix)
-        result_14 = transform_to_order_import(df_14, order_group, cust_instr_template, remark_prefix)
-        result_other = transform_to_order_import(df_other, order_group, cust_instr_template, remark_prefix)
+        result_18 = transform_to_order_import(
+            df_18, order_group, cust_instr_template, remark_prefix
+        )
+        result_14 = transform_to_order_import(
+            df_14, order_group, cust_instr_template, remark_prefix
+        )
+        result_other = transform_to_order_import(
+            df_other, order_group, cust_instr_template, remark_prefix
+        )
 
         if result_18.empty and result_14.empty and result_other.empty:
             st.error(
                 "No rows generated.\n\n"
                 "Check that:\n"
-                "- A STYLE / DESIGN column exists (will be mapped to 'DESIGN CODE'), and\n"
-                "- An order quantity column (ORDER PCS / ORDER QTY / etc.) exists with values > 0."
+                "- A STYLE / DESIGN column exists (will be mapped automatically), and\n"
+                "- An order quantity column (ORDER PCS / ORDER QTY / etc.) exists with values > 0.\n"
+                "Also see the detected columns list above."
             )
         else:
             st.subheader("Generated Order Import Sheets (Preview)")
